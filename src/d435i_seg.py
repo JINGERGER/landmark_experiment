@@ -464,23 +464,23 @@ class YOLO11SegmentationNode(Node):
                 valid_depths = depth_roi[depth_roi > 0]
                 
                 if len(valid_depths) > 0:
-                    # Calculate average depth in mm (D435i outputs depth in mm)
-                    avg_depth_mm = np.median(valid_depths)
-                    avg_depth_m = avg_depth_mm / 1000.0  # Convert to meters
+                    # Calculate minimum depth in mm (D435i outputs depth in mm)
+                    min_depth_mm = np.min(valid_depths)
+                    min_depth_m = min_depth_mm / 1000.0  # Convert to meters
                     
                     # Debug: Log depth information for each object
-                    self.get_logger().info(f"🔍 {class_name} depth: {avg_depth_m:.2f}m (range: {self.min_distance}-{self.max_distance}m), valid_depths: {len(valid_depths)}")
+                    self.get_logger().info(f"🔍 {class_name} depth: {min_depth_m:.2f}m (range: {self.min_distance}-{self.max_distance}m), valid_depths: {len(valid_depths)}")
                     
                     # Filter by distance range
-                    if self.min_distance <= avg_depth_m <= self.max_distance:
+                    if self.min_distance <= min_depth_m <= self.max_distance:
                         # Get center point of bounding box
                         center_x = (x1 + x2) // 2
                         center_y = (y1 + y2) // 2
                         
                         # Convert pixel coordinates to 3D camera coordinates
-                        x_3d = (center_x - self.cx) * avg_depth_m / self.fx
-                        y_3d = (center_y - self.cy) * avg_depth_m / self.fy
-                        z_3d = avg_depth_m
+                        x_3d = (center_x - self.cx) * min_depth_m / self.fx
+                        y_3d = (center_y - self.cy) * min_depth_m / self.fy
+                        z_3d = min_depth_m
                         
                         # Convert to BEV coordinates
                         # Camera coordinate system: X-right, Y-down, Z-forward
@@ -507,14 +507,14 @@ class YOLO11SegmentationNode(Node):
                             
                             # Convert pixel size to real-world size using depth
                             # Object width in meters = (pixel_width * depth) / focal_length
-                            obj_width_m = (obj_width_px * avg_depth_m) / self.fx
-                            obj_height_m = (obj_height_px * avg_depth_m) / self.fy
+                            obj_width_m = (obj_width_px * min_depth_m) / self.fx
+                            obj_height_m = (obj_height_px * min_depth_m) / self.fy
                             
                             # Use mask area for better size estimation
                             mask_area_px = np.sum(mask_binary)
                             # Estimate equivalent circle radius from mask area
                             equivalent_radius_px = np.sqrt(mask_area_px / np.pi)
-                            equivalent_radius_m = (equivalent_radius_px * avg_depth_m) / ((self.fx + self.fy) / 2)
+                            equivalent_radius_m = (equivalent_radius_px * min_depth_m) / ((self.fx + self.fy) / 2)
                             
                             # Convert real-world size to BEV pixel size
                             bev_radius_px = max(3, int((equivalent_radius_m / self.bev_x_range) * self.bev_width * 0.5))
@@ -553,7 +553,7 @@ class YOLO11SegmentationNode(Node):
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
                             
                             # Add distance and size info
-                            dist_label = f"{avg_depth_m:.1f}m"
+                            dist_label = f"{min_depth_m:.1f}m"
                             size_label = f"{equivalent_radius_m*2:.2f}m"
                             info_text = f"{dist_label} {size_label}"
                             
@@ -576,8 +576,8 @@ class YOLO11SegmentationNode(Node):
                         for detection in segmentation_data['detections']:
                             if detection['id'] == i:
                                 detection['depth'] = {
-                                    'avg_depth_m': float(avg_depth_m),
-                                    'avg_depth_mm': float(avg_depth_mm),
+                                    'min_depth_m': float(min_depth_m),
+                                    'min_depth_mm': float(min_depth_mm),
                                     'camera_3d': {'x': float(x_3d), 'y': float(y_3d), 'z': float(z_3d)},
                                     'bev_coords': {'x': float(bev_x), 'y': float(bev_y)},
                                     'bev_pixels': {'x': int(bev_pixel_x), 'y': int(bev_pixel_y)},
@@ -596,7 +596,7 @@ class YOLO11SegmentationNode(Node):
                             self.get_logger().warn(f"❌ {class_name} NOT projected: pixel({bev_pixel_x}, {bev_pixel_y}) outside BEV bounds (0-{self.bev_width-1}, 0-{self.bev_height-1})")
                     else:
                         # Debug: Log why object was filtered out by distance
-                        self.get_logger().warn(f"❌ {class_name} filtered by distance: {avg_depth_m:.2f}m outside range ({self.min_distance}-{self.max_distance}m)")
+                        self.get_logger().warn(f"❌ {class_name} filtered by distance: {min_depth_m:.2f}m outside range ({self.min_distance}-{self.max_distance}m)")
                 else:
                     # Debug: Log objects with no valid depth
                     self.get_logger().warn(f"❌ {class_name} has no valid depth values from mask region")
