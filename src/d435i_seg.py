@@ -13,11 +13,14 @@ Publishes to: /yolo11/segmentation/image (annotated image with masks)
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
-from std_msgs.msg import String
+from std_msgs.msg import String, Header
+from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray
 from cv_bridge import CvBridge
+from bev.msg import BevObject, BevObjectArray
 import cv2
 import numpy as np
 import json
+import time
 from datetime import datetime
 import os
 
@@ -49,6 +52,7 @@ class YOLO11SegmentationNode(Node):
         self.declare_parameter('output_masks_topic', '/yolo11/segmentation/masks')
         self.declare_parameter('output_data_topic', '/yolo11/segmentation/data')
         self.declare_parameter('output_bev_topic', '/yolo11/bev/detections')
+        self.declare_parameter('output_bev_data_topic', '/yolo11/bev/objects')  # New topic for structured BEV data
         self.declare_parameter('save_results', True)
         self.declare_parameter('save_path', '/tmp/yolo11_seg_results')
         self.declare_parameter('show_fps', True)
@@ -73,6 +77,7 @@ class YOLO11SegmentationNode(Node):
         self.output_masks_topic = self.get_parameter('output_masks_topic').get_parameter_value().string_value
         self.output_data_topic = self.get_parameter('output_data_topic').get_parameter_value().string_value
         self.output_bev_topic = self.get_parameter('output_bev_topic').get_parameter_value().string_value
+        self.output_bev_data_topic = self.get_parameter('output_bev_data_topic').get_parameter_value().string_value
         self.save_results = self.get_parameter('save_results').get_parameter_value().bool_value
         self.save_path = self.get_parameter('save_path').get_parameter_value().string_value
         self.show_fps = self.get_parameter('show_fps').get_parameter_value().bool_value
@@ -175,6 +180,12 @@ class YOLO11SegmentationNode(Node):
             10
         )
         
+        self.bev_data_pub = self.create_publisher(
+            BevObjectArray,  # 使用自定义消息类型代替String
+            self.output_bev_data_topic,
+            10
+        )
+        
         self.get_logger().info(f"🚀 YOLO11 Segmentation Node initialized")
         self.get_logger().info(f"📥 Subscribing to depth: {self.depth_topic}")
         self.get_logger().info(f"📥 Subscribing to color: {self.color_topic}")
@@ -183,6 +194,7 @@ class YOLO11SegmentationNode(Node):
         self.get_logger().info(f"📤 Publishing segmentation masks to: {self.output_masks_topic}")
         self.get_logger().info(f"📤 Publishing segmentation data to: {self.output_data_topic}")
         self.get_logger().info(f"📤 Publishing BEV detections to: {self.output_bev_topic}")
+        self.get_logger().info(f"📤 Publishing BEV object data to: {self.output_bev_data_topic}")
 
     def camera_info_callback(self, msg):
         """Store camera intrinsics for depth-to-3D conversion"""
@@ -685,7 +697,67 @@ class YOLO11SegmentationNode(Node):
             mask_msg.header.stamp = header
             self.masks_pub.publish(mask_msg)
             
-            # Publish BEV image
+            # Publish structured BEV data using custom message format
+            if len(segmentation_data['detections']) > 0:
+                bev_objects_with_depth = []
+                
+                for detection in segmentation_data['detections']:
+                    # Only include objects that have depth and BEV coordinates
+                    if 'depth' in detection and 'bev_coords' in detection['depth']:
+                        bev_coords = detection['depth']['bev_coords']
+                        camera_3d = detection['depth']['camera_3d']
+                        size_info = detection['depth']['size_info']
+                        
+                        # Create BevObject message
+                        bev_obj = BevObject()
+                        bev_obj.class_name = detection['class']
+                        bev_obj.confidence = float(detection['confidence'])
+                        
+                        # 3D position in camera coordinates
+                        bev_obj.camera_3d_position = Point()
+                        bev_obj.camera_3d_position.x = float(camera_3d['x'])
+                        bev_obj.camera_3d_position.y = float(camera_3d['y'])
+                        bev_obj.camera_3d_position.z = float(camera_3d['z'])
+                        
+                        # BEV position in meters
+                        bev_obj.bev_position = Point()
+                        bev_obj.bev_position.x = float(bev_coords['x'])  # forward
+                        bev_obj.bev_position.y = float(bev_coords['y'])  # left
+                        bev_obj.bev_position.z = 0.0
+                        
+                        # BEV pixel position
+                        bev_obj.bev_pixel_position = Point()
+                        bev_obj.bev_pixel_position.x = float(detection['depth']['bev_pixels']['x'])
+                        bev_obj.bev_pixel_position.y = float(detection['depth']['bev_pixels']['y'])
+                        bev_obj.bev_pixel_position.z = 0.0
+                        
+                        # Size and distance information
+                        bev_obj.equivalent_diameter_m = float(size_info['equivalent_diameter_m'])
+                        bev_obj.depth_m = float(detection['depth']['min_depth_m'])
+                        bev_obj.area_pixels = int(detection['segmentation']['area'])
+                        
+                        bev_objects_with_depth.append(bev_obj)
+                
+                if len(bev_objects_with_depth) > 0:
+                    # Create BevObjectArray message
+                    bev_array = BevObjectArray()
+                    bev_array.header.stamp = header
+                    bev_array.header.frame_id = "camera_bev"
+                    bev_array.objects = bev_objects_with_depth
+                    bev_array.total_objects = len(bev_objects_with_depth)
+                    
+                    # BEV range information
+                    bev_array.bev_range = Point()
+                    bev_array.bev_range.x = float(self.bev_x_range)
+                    bev_array.bev_range.y = float(self.bev_y_range)
+                    bev_array.bev_range.z = 0.0
+                    
+                    # Publish the custom message
+                    self.bev_data_pub.publish(bev_array)
+                    
+                    self.get_logger().info(f"📍 Published BEV structured data for {len(bev_objects_with_depth)} objects using custom message format")
+            
+            # Publish BEV image (existing code)
             bev_msg = self.bridge.cv2_to_imgmsg(bev_image, encoding='bgr8')
             bev_msg.header.stamp = header
             self.bev_pub.publish(bev_msg)
