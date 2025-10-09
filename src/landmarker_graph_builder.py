@@ -6,6 +6,7 @@ Landmark Graph Builder Node
 Subscribes to: 
     /yolo11/bev/objects - BEV物体检测结果 (BevObjectArray)
     /odom - 里程计数据 (Odometry)
+    /camera/camera/color/image_raw - 彩色图像 (Image)
     
 Publishes to:
     /landmark_graph/markers - 地标图可视化 (MarkerArray)
@@ -19,11 +20,14 @@ from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import String, Header
 from geometry_msgs.msg import Point, Quaternion, Pose, Vector3
+from sensor_msgs.msg import Image
 import json
 import numpy as np
 import math
 from datetime import datetime
 import time
+import cv2
+from cv_bridge import CvBridge
 
 class LandmarkGraphBuilder(Node):
     def __init__(self):
@@ -42,6 +46,7 @@ class LandmarkGraphBuilder(Node):
         self.declare_parameter('enable_vlm_association', False)       # 启用VLM关联
         self.declare_parameter('vlm_model_name', 'gpt-4-vision-preview')  # VLM模型名称
         self.declare_parameter('vlm_confidence_threshold', 0.7)       # VLM关联置信度阈值
+        self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         
         # Get parameters
         self.bev_objects_topic = self.get_parameter('bev_objects_topic').get_parameter_value().string_value
@@ -56,7 +61,9 @@ class LandmarkGraphBuilder(Node):
         self.vlm_enabled = self.get_parameter('enable_vlm_association').get_parameter_value().bool_value
         self.vlm_model = self.get_parameter('vlm_model_name').get_parameter_value().string_value
         self.vlm_confidence_threshold = self.get_parameter('vlm_confidence_threshold').get_parameter_value().double_value
-        
+        # 订阅彩色图像话题（用于VLM多模态）
+        self.color_topic = self.get_parameter('color_topic').get_parameter_value().string_value
+         
         # 地标图数据结构
         self.landmarks = {}  # landmark_id: LandmarkData
         self.next_landmark_id = 1
@@ -68,6 +75,10 @@ class LandmarkGraphBuilder(Node):
         # 最新的BEV检测数据
         self.latest_bev_objects = None
         self.last_bev_timestamp = None
+        
+        # 彩色图像处理
+        self.bridge = CvBridge()
+        self.latest_color_image_path = None
         
         # Create subscribers
         self.bev_sub = self.create_subscription(
@@ -82,6 +93,13 @@ class LandmarkGraphBuilder(Node):
             self.odom_topic,
             self.odom_callback,
             10
+        )
+        
+        self.color_sub = self.create_subscription(
+            Image,
+            self.color_topic,
+            self.color_image_callback,
+            5
         )
         
         # Create publishers
@@ -103,6 +121,7 @@ class LandmarkGraphBuilder(Node):
         self.get_logger().info(f"🚀 Landmark Graph Builder initialized")
         self.get_logger().info(f"📥 Subscribing to BEV objects: {self.bev_objects_topic}")
         self.get_logger().info(f"📥 Subscribing to odometry: {self.odom_topic}")
+        self.get_logger().info(f"📥 Subscribing to color images: {self.color_topic}")
         self.get_logger().info(f"📤 Publishing markers to: {self.landmark_markers_topic}")
         self.get_logger().info(f"📤 Publishing data to: {self.landmark_data_topic}")
         self.get_logger().info(f"🔧 Association threshold: {self.association_threshold}m")
@@ -128,6 +147,16 @@ class LandmarkGraphBuilder(Node):
         if self.robot_pose is not None:
             self.process_bev_objects_with_odom(msg)
             self.latest_bev_objects = None
+
+    def color_image_callback(self, msg):
+        """保存最近一帧彩色图像到本地，供VLM使用"""
+        try:
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            save_path = f"/tmp/vlm_latest_color.jpg"
+            cv2.imwrite(save_path, cv_img)
+            self.latest_color_image_path = save_path
+        except Exception as e:
+            self.get_logger().warn(f"Failed to save color image: {e}")
 
     def process_bev_objects_with_odom(self, bev_msg):
         """将BEV检测结果与里程计数据关联，更新地标图"""
@@ -592,11 +621,15 @@ class LandmarkGraphBuilder(Node):
         If no suitable match exists, return best_match_id as null.
         """
         
-        return {
+        query = {
             'prompt': prompt,
             'current_object': current_description,
             'candidates': candidate_descriptions
         }
+        # 如果有最新彩色图像，加入image_url字段（本地文件路径）
+        if self.latest_color_image_path:
+            query['image_url'] = f"file://{self.latest_color_image_path}"
+        return query
     
     def query_vlm(self, query):
         """查询VLM API"""
@@ -688,7 +721,7 @@ class LandmarkGraphBuilder(Node):
             return None
     
     def query_qwen_vlm(self, query):
-        """调用Qwen VLM API (Aliyun 百炼)"""
+        """调用Qwen VLM API (Aliyun 百炼)，支持多模态（图文）输入"""
         try:
             import os
             from openai import OpenAI
@@ -696,12 +729,24 @@ class LandmarkGraphBuilder(Node):
                 api_key=os.getenv("DASHSCOPE_API_KEY"),
                 base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
             )
-            response = client.chat.completions.create(
-                model=self.vlm_model,  # e.g., "qwen3-vl-plus"
-                messages=[
+            # 判断是否有图片URL
+            image_url = query.get('image_url', None)
+            if image_url:
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": query['prompt']},
+                    ]},
+                ]
+            else:
+                messages = [
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": query['prompt']},
-                ],
+                ]
+            response = client.chat.completions.create(
+                model=self.vlm_model,  # e.g., "qwen3-vl-plus"
+                messages=messages,
                 max_tokens=500,
                 temperature=0.1
             )

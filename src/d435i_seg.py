@@ -58,6 +58,8 @@ class YOLO11SegmentationNode(Node):
         self.declare_parameter('show_fps', True)
         self.declare_parameter('show_masks', True)
         self.declare_parameter('mask_alpha', 0.4)  # Transparency for mask overlay
+        # Add configurable save interval (seconds)
+        self.declare_parameter('save_interval_sec', 5.0)
         # BEV parameters
         self.declare_parameter('bev_width', 800)
         self.declare_parameter('bev_height', 600)
@@ -65,7 +67,19 @@ class YOLO11SegmentationNode(Node):
         self.declare_parameter('bev_y_range', 3.0)  # BEV Y range in meters (left-right)
         self.declare_parameter('min_distance', 0.1) # Minimum distance in meters (changed from 0.5 to 0.1)
         self.declare_parameter('max_distance', 10.0)# Maximum distance in meters
-        
+        self.declare_parameter('bev_size_scale', 1.0)  # New parameter for BEV size scaling
+        self.declare_parameter('bev_size_reference_values', '0.1,0.3,0.5,1.0')  # meters (diameters)
+        # BEV label/layout options
+        self.declare_parameter('bev_draw_connectors', True)   # draw leader lines from text boxes to object
+        self.declare_parameter('bev_number_labels', True)     # prefix labels with object id
+        self.declare_parameter('bev_label_border_object_color', True)  # use object color for text box border
+        # NEW: BEV font configuration (larger defaults)
+        self.declare_parameter('bev_label_font_scale', 0.9)
+        self.declare_parameter('bev_info_font_scale', 0.8)
+        self.declare_parameter('bev_label_thickness', 2)
+        self.declare_parameter('bev_info_thickness', 2)
+        # ... existing code ...
+
         # Get parameters
         self.model_name = self.get_parameter('model_name').get_parameter_value().string_value
         self.confidence_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
@@ -83,6 +97,8 @@ class YOLO11SegmentationNode(Node):
         self.show_fps = self.get_parameter('show_fps').get_parameter_value().bool_value
         self.show_masks = self.get_parameter('show_masks').get_parameter_value().bool_value
         self.mask_alpha = self.get_parameter('mask_alpha').get_parameter_value().double_value
+        # Get configurable save interval
+        self.save_interval_sec = self.get_parameter('save_interval_sec').get_parameter_value().double_value
         
         # BEV parameters
         self.bev_width = self.get_parameter('bev_width').get_parameter_value().integer_value
@@ -91,6 +107,21 @@ class YOLO11SegmentationNode(Node):
         self.bev_y_range = self.get_parameter('bev_y_range').get_parameter_value().double_value
         self.min_distance = self.get_parameter('min_distance').get_parameter_value().double_value
         self.max_distance = self.get_parameter('max_distance').get_parameter_value().double_value
+        self.bev_size_scale = self.get_parameter('bev_size_scale').get_parameter_value().double_value
+        ref_str = self.get_parameter('bev_size_reference_values').get_parameter_value().string_value
+        try:
+            self.bev_size_ref_values = [float(v.strip()) for v in ref_str.split(',') if v.strip()]
+        except Exception:
+            self.bev_size_ref_values = [0.1, 0.3, 0.5, 1.0]
+        # Read BEV label/layout options
+        self.bev_draw_connectors = self.get_parameter('bev_draw_connectors').get_parameter_value().bool_value
+        self.bev_number_labels = self.get_parameter('bev_number_labels').get_parameter_value().bool_value
+        self.bev_label_border_object_color = self.get_parameter('bev_label_border_object_color').get_parameter_value().bool_value
+        # NEW: Read BEV font configuration
+        self.bev_label_font_scale = self.get_parameter('bev_label_font_scale').get_parameter_value().double_value
+        self.bev_info_font_scale = self.get_parameter('bev_info_font_scale').get_parameter_value().double_value
+        self.bev_label_thickness = self.get_parameter('bev_label_thickness').get_parameter_value().integer_value
+        self.bev_info_thickness = self.get_parameter('bev_info_thickness').get_parameter_value().integer_value
         
         # Initialize YOLO11 segmentation model
         self.get_logger().info(f"Loading YOLO11 segmentation model: {self.model_name}")
@@ -127,6 +158,8 @@ class YOLO11SegmentationNode(Node):
             os.makedirs(self.save_path, exist_ok=True)
             self.get_logger().info(f"Results will be saved to: {self.save_path}")
             self.image_counter = 0
+            # Initialize last save time
+            self.last_save_time = None
         
         # FPS calculation
         self.fps_counter = 0
@@ -293,7 +326,7 @@ class YOLO11SegmentationNode(Node):
             'confidence_threshold': self.confidence_threshold,
             'iou_threshold': self.iou_threshold,
             'detections': []
-        }
+        };
         
         # Process detections and segmentation masks
         if results.boxes is not None and results.masks is not None:
@@ -452,6 +485,8 @@ class YOLO11SegmentationNode(Node):
         self.draw_bev_grid(bev_image)
         
         # Process each detection with depth
+        # Track all drawn rectangles to avoid overlaps (ellipse, labels, info boxes)
+        overlay_rects = []
         if results.boxes is not None and results.masks is not None:
             self.get_logger().info(f"🔍 Processing {len(results.boxes)} detections for BEV projection")
             bev_objects_count = 0
@@ -459,7 +494,28 @@ class YOLO11SegmentationNode(Node):
             for i, (box, mask) in enumerate(zip(results.boxes, results.masks)):
                 if box.conf[0] < self.confidence_threshold:
                     continue
-                    
+
+                # ---- Initialize to avoid UnboundLocalError on any branch ----
+                obj_width_m = 0.0
+                obj_height_m = 0.0
+                equivalent_radius_m = 0.0
+                footprint_diameter_m = 0.0
+                radius_m = 0.0
+                bev_radius_px = 0
+                bev_width_px = 0
+                bev_height_px = 0
+                mask_area_px = 0
+                depth_for_size_m = 0.0
+                min_depth_m = 0.0
+                min_depth_mm = 0.0
+                avg_depth_m = 0.0
+                x_3d = y_3d = z_3d = 0.0
+                bev_x = bev_y = 0.0
+                bev_pixel_x = bev_pixel_y = -1
+                has_depth = False
+                has_size = False
+                # -------------------------------------------------------------
+
                 # Get detection info
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 class_id = int(box.cls[0])
@@ -476,147 +532,221 @@ class YOLO11SegmentationNode(Node):
                 valid_depths = depth_roi[depth_roi > 0]
                 
                 if len(valid_depths) > 0:
-                    # Calculate minimum depth in mm (D435i outputs depth in mm)
+                    # Depth stats
                     min_depth_mm = np.min(valid_depths)
-                    min_depth_m = min_depth_mm / 1000.0  # Convert to meters
+                    avg_depth_mm = float(np.mean(valid_depths))
+                    min_depth_m = min_depth_mm / 1000.0
+                    avg_depth_m = avg_depth_mm / 1000.0
+                    depth_for_size_m = avg_depth_m
+                    has_depth = True
+
+                    self.get_logger().info(
+                        f"🔍 {class_name} depth: {min_depth_m:.2f}m (range: {self.min_distance}-{self.max_distance}m), valid_depths: {len(valid_depths)}"
+                    )
                     
-                    # Debug: Log depth information for each object
-                    self.get_logger().info(f"🔍 {class_name} depth: {min_depth_m:.2f}m (range: {self.min_distance}-{self.max_distance}m), valid_depths: {len(valid_depths)}")
-                    
-                    # Filter by distance range
+                    # Distance filter
                     if self.min_distance <= min_depth_m <= self.max_distance:
-                        # Get center point of bounding box
+                        # Center of bbox
                         center_x = (x1 + x2) // 2
                         center_y = (y1 + y2) // 2
                         
-                        # Convert pixel coordinates to 3D camera coordinates
-                        x_3d = (center_x - self.cx) * min_depth_m / self.fx
-                        y_3d = (center_y - self.cy) * min_depth_m / self.fy
+                        # Camera 3D (use min depth for position)
+                        x_3d = (center_x - self.cx) * min_depth_m / self.fx if self.fx else 0.0
+                        y_3d = (center_y - self.cy) * min_depth_m / self.fy if self.fy else 0.0
                         z_3d = min_depth_m
                         
-                        # Convert to BEV coordinates
-                        # Camera coordinate system: X-right, Y-down, Z-forward
-                        # BEV coordinate system: X-forward, Y-left
-                        bev_x = z_3d  # Camera Z becomes BEV X (forward)
-                        bev_y = -x_3d  # Camera -X becomes BEV Y (left)
+                        # BEV meters
+                        bev_x = z_3d
+                        bev_y = -x_3d
                         
-                        # Convert to pixel coordinates in BEV image
-                        # New coordinate system: origin at bottom center
+                        # BEV pixels (origin: bottom-center)
                         bev_pixel_x = int(self.bev_width/2 + (bev_y / self.bev_y_range) * self.bev_width)
                         bev_pixel_y = int(self.bev_height - (bev_x / self.bev_x_range) * self.bev_height)
-                        
-                        # Check if point is within BEV image bounds
-                        if (0 <= bev_pixel_x < self.bev_width and 
-                            0 <= bev_pixel_y < self.bev_height):
-                            
-                            # Debug: Log successful BEV projection
-                            self.get_logger().info(f"✅ {class_name} projected to BEV at pixel({bev_pixel_x}, {bev_pixel_y})")
-                            
-                            # Calculate object size in BEV first
-                            # Get object dimensions in pixels
-                            obj_width_px = x2 - x1
-                            obj_height_px = y2 - y1
-                            
-                            # Convert pixel size to real-world size using depth
-                            # Object width in meters = (pixel_width * depth) / focal_length
-                            obj_width_m = (obj_width_px * min_depth_m) / self.fx
-                            obj_height_m = (obj_height_px * min_depth_m) / self.fy
-                            
-                            # Use mask area for better size estimation
-                            mask_area_px = np.sum(mask_binary)
-                            # Estimate equivalent circle radius from mask area
+
+                        # Scales
+                        scale_lateral = self.bev_width / self.bev_y_range   # px/m
+                        scale_forward = self.bev_height / self.bev_x_range  # px/m
+
+                        # Compute metric size using avg depth (more stable)
+                        obj_width_px = max(1, x2 - x1)
+                        obj_height_px = max(1, y2 - y1)
+                        if depth_for_size_m > 0 and self.fx and self.fy:
+                            obj_width_m = (obj_width_px * depth_for_size_m) / self.fx
+                            obj_height_m = (obj_height_px * depth_for_size_m) / self.fy
+
+                        # Mask → equivalent radius in meters
+                        mask_area_px = int(np.sum(mask_binary))
+                        if mask_area_px > 0 and depth_for_size_m > 0:
                             equivalent_radius_px = np.sqrt(mask_area_px / np.pi)
-                            equivalent_radius_m = (equivalent_radius_px * min_depth_m) / ((self.fx + self.fy) / 2)
-                            
-                            # Convert real-world size to BEV pixel size
-                            bev_radius_px = max(3, int((equivalent_radius_m / self.bev_x_range) * self.bev_width * 0.5))
-                            bev_radius_px = min(bev_radius_px, 25)  # Limit maximum size
-                            
-                            bev_objects_count += 1
-                            # Debug info
-                            self.get_logger().debug(f"🎯 BEV: {class_name} at ({bev_x:.2f}m, {bev_y:.2f}m) -> pixel({bev_pixel_x}, {bev_pixel_y}), radius={bev_radius_px}px")
-                            
-                            # Draw detection on BEV
-                            color = self.get_class_color(class_id)
-                            
-                            # Draw object with size proportional to its real size
-                            cv2.circle(bev_image, (bev_pixel_x, bev_pixel_y), bev_radius_px, color, -1)
-                            cv2.circle(bev_image, (bev_pixel_x, bev_pixel_y), bev_radius_px + 3, (255, 255, 255), 3)
-                            
-                            # Add center point
-                            cv2.circle(bev_image, (bev_pixel_x, bev_pixel_y), 3, (0, 0, 0), -1)
-                            
-                            # Draw label
-                            label = f"{class_name}"
-                            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-                            label_x = max(5, min(bev_pixel_x - label_size[0]//2, self.bev_width - label_size[0] - 5))
-                            label_y = max(20, bev_pixel_y - bev_radius_px - 25)
-                            
-                            # Background for text
-                            cv2.rectangle(bev_image, 
-                                        (label_x - 3, label_y - 15),
-                                        (label_x + label_size[0] + 3, label_y + 3),
-                                        (0, 0, 0), -1)
-                            cv2.rectangle(bev_image, 
-                                        (label_x - 3, label_y - 15),
-                                        (label_x + label_size[0] + 3, label_y + 3),
-                                        (255, 255, 255), 1)
-                            cv2.putText(bev_image, label, (label_x, label_y),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                            
-                            # Add distance and size info
-                            dist_label = f"{min_depth_m:.1f}m"
-                            size_label = f"{equivalent_radius_m*2:.2f}m"
-                            info_text = f"{dist_label} {size_label}"
-                            
-                            info_size = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
-                            info_x = max(5, min(bev_pixel_x - info_size[0]//2, self.bev_width - info_size[0] - 5))
-                            info_y = min(self.bev_height - 10, bev_pixel_y + bev_radius_px + 20)
-                            
-                            cv2.rectangle(bev_image,
-                                        (info_x - 2, info_y - 12),
-                                        (info_x + info_size[0] + 2, info_y + 2),
-                                        (0, 0, 0), -1)
-                            cv2.rectangle(bev_image,
-                                        (info_x - 2, info_y - 12),
-                                        (info_x + info_size[0] + 2, info_y + 2),
-                                        (0, 255, 255), 1)
-                            cv2.putText(bev_image, info_text, (info_x, info_y),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 2)
-                        
-                        # Update segmentation data with depth info
-                        for detection in segmentation_data['detections']:
-                            if detection['id'] == i:
-                                detection['depth'] = {
-                                    'min_depth_m': float(min_depth_m),
-                                    'min_depth_mm': float(min_depth_mm),
-                                    'camera_3d': {'x': float(x_3d), 'y': float(y_3d), 'z': float(z_3d)},
-                                    'bev_coords': {'x': float(bev_x), 'y': float(bev_y)},
-                                    'bev_pixels': {'x': int(bev_pixel_x), 'y': int(bev_pixel_y)},
-                                    'size_info': {
-                                        'width_m': float(obj_width_m),
-                                        'height_m': float(obj_height_m),
-                                        'equivalent_radius_m': float(equivalent_radius_m),
-                                        'equivalent_diameter_m': float(equivalent_radius_m * 2),
-                                        'mask_area_px': int(mask_area_px),
-                                        'bev_radius_px': int(bev_radius_px)
-                                    }
-                                }
-                                break
+                            f_mean = (self.fx + self.fy) / 2.0 if (self.fx and self.fy) else (self.fx or 1.0)
+                            equivalent_radius_m = (equivalent_radius_px * depth_for_size_m) / f_mean
                         else:
-                            # Debug: Log why object was not projected to BEV
-                            self.get_logger().warn(f"❌ {class_name} NOT projected: pixel({bev_pixel_x}, {bev_pixel_y}) outside BEV bounds (0-{self.bev_width-1}, 0-{self.bev_height-1})")
+                            equivalent_radius_m = 0.0
+                        
+                        # Footprint diameter (fallback to equivalent circle)
+                        footprint_diameter_m = max(obj_width_m, obj_height_m)
+                        if footprint_diameter_m <= 0 and equivalent_radius_m > 0:
+                            footprint_diameter_m = equivalent_radius_m * 2.0
+                        if footprint_diameter_m <= 0:
+                            footprint_diameter_m = 0.10  # final fallback
+
+                        radius_m = max(0.05, footprint_diameter_m / 2.0)
+                        isotropic_scale = (scale_lateral + scale_forward) / 2.0
+                        bev_radius_px = int(radius_m * isotropic_scale * self.bev_size_scale)
+                        bev_radius_px = max(3, min(bev_radius_px, 40))
+
+                        bev_width_px = int(obj_width_m * scale_lateral * self.bev_size_scale)
+                        bev_height_px = int(obj_height_m * scale_forward * self.bev_size_scale)
+                        if bev_width_px <= 0:  bev_width_px = bev_radius_px * 2
+                        if bev_height_px <= 0: bev_height_px = bev_radius_px * 2
+                        bev_width_px = max(6, min(bev_width_px, 80))
+                        bev_height_px = max(6, min(bev_height_px, 80))
+                        has_size = True
+
+                        # Draw only if inside BEV bounds
+                        if (0 <= bev_pixel_x < self.bev_width and 0 <= bev_pixel_y < self.bev_height):
+                            self.get_logger().info(
+                                f"✅ {class_name} projected to BEV at pixel({bev_pixel_x}, {bev_pixel_y})"
+                            )
+                            color = self.get_class_color(class_id)
+                            center = (bev_pixel_x, bev_pixel_y)
+                            axes = (bev_width_px // 2, bev_height_px // 2)
+                            cv2.ellipse(bev_image, center, axes, 0, 0, 360, color, -1)
+                            cv2.ellipse(bev_image, center, axes, 0, 0, 360, (255, 255, 255), 2)
+                            cv2.circle(bev_image, center, 3, (0, 0, 0), -1)
+
+                            # Mark ellipse bounding rect as occupied（避免标签遮盖椭圆）
+                            ell_rect = [
+                                max(0, center[0] - axes[0] - 2),
+                                max(0, center[1] - axes[1] - 2),
+                                min(self.bev_width - 1,  center[0] + axes[0] + 2),
+                                min(self.bev_height - 1, center[1] + axes[1] + 2)
+                            ]
+                            overlay_rects.append(ell_rect)
+
+                            # Labels（类名）
+                            obj_id = int(i)
+                            label = f"#{obj_id} {class_name}" if self.bev_number_labels else f"{class_name}"
+                            (lw, lh), lbase = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, self.bev_label_font_scale, self.bev_label_thickness)
+                            lpad = max(3, int(4 * self.bev_label_font_scale))
+                            lbox_w = lw + lpad * 2
+                            lbox_h = lh + lpad * 2
+                            # candidates: above center, above-left, above-right, right, left, below
+                            cand_label = [
+                                (bev_pixel_x - lbox_w // 2, bev_pixel_y - axes[1] - lbox_h - 8),
+                                (bev_pixel_x - axes[0] - lbox_w - 8, bev_pixel_y - axes[1] - lbox_h - 8),
+                                (bev_pixel_x + axes[0] + 8,        bev_pixel_y - axes[1] - lbox_h - 8),
+                                (bev_pixel_x + axes[0] + 8,        bev_pixel_y - lbox_h // 2),
+                                (bev_pixel_x - axes[0] - lbox_w - 8, bev_pixel_y - lbox_h // 2),
+                                (bev_pixel_x - lbox_w // 2,        bev_pixel_y + axes[1] + 8),
+                            ]
+                            lrect = self._place_box_no_overlap(lbox_w, lbox_h, cand_label, overlay_rects, self.bev_width, self.bev_height)
+                            cv2.rectangle(bev_image, (lrect[0], lrect[1]), (lrect[2], lrect[3]), (0, 0, 0), -1)
+                            border_label = color if self.bev_label_border_object_color else (255, 255, 255)
+                            cv2.rectangle(bev_image, (lrect[0], lrect[1]), (lrect[2], lrect[3]), border_label, 1)
+                            cv2.putText(
+                                bev_image,
+                                label,
+                                (lrect[0] + lpad, lrect[1] + lpad + lh),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                self.bev_label_font_scale,
+                                (255, 255, 255),
+                                self.bev_label_thickness,
+                            )
+                            overlay_rects.append(lrect)
+
+                            # Info box（距离与尺寸，三位小数）
+                            dist_label = f"{min_depth_m:.3f}m"
+                            size_label = f"{equivalent_radius_m*2:.3f}m"
+                            info_text = f"#{obj_id} {dist_label} {size_label}" if self.bev_number_labels else f"{dist_label} {size_label}"
+                            (tw, th), tbase = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, self.bev_info_font_scale, self.bev_info_thickness)
+                            tpad = max(2, int(3 * self.bev_info_font_scale))
+                            tbox_w = tw + tpad * 2
+                            tbox_h = th + tpad * 2
+                            # candidates: below center, below-right, below-left, above center, right, left
+                            cand_info = [
+                                (bev_pixel_x - tbox_w // 2, bev_pixel_y + axes[1] + 8),
+                                (bev_pixel_x + axes[0] + 8, bev_pixel_y + axes[1] + 8),
+                                (bev_pixel_x - axes[0] - tbox_w - 8, bev_pixel_y + axes[1] + 8),
+                                (bev_pixel_x - tbox_w // 2, bev_pixel_y - axes[1] - tbox_h - 8),
+                                (bev_pixel_x + axes[0] + 8, bev_pixel_y - tbox_h // 2),
+                                (bev_pixel_x - axes[0] - tbox_w - 8, bev_pixel_y - tbox_h // 2),
+                            ]
+                            trect = self._place_box_no_overlap(tbox_w, tbox_h, cand_info, overlay_rects, self.bev_width, self.bev_height)
+                            cv2.rectangle(bev_image, (trect[0], trect[1]), (trect[2], trect[3]), (0, 0, 0), -1)
+                            border_info = color if self.bev_label_border_object_color else (0, 255, 255)
+                            cv2.rectangle(bev_image, (trect[0], trect[1]), (trect[2], trect[3]), border_info, 1)
+                            cv2.putText(
+                                bev_image,
+                                info_text,
+                                (trect[0] + tpad, trect[1] + tpad + th),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                self.bev_info_font_scale,
+                                (0, 255, 255),
+                                self.bev_info_thickness,
+                            )
+                            overlay_rects.append(trect)
+
+                            # Optional: draw connectors from boxes to object center
+                            if self.bev_draw_connectors:
+                                lcx = (lrect[0] + lrect[2]) // 2
+                                lcy = (lrect[1] + lrect[3]) // 2
+                                tcx = (trect[0] + trect[2]) // 2
+                                tcy = (trect[1] + trect[3]) // 2
+                                cv2.line(bev_image, (lcx, lcy), center, color, 1, cv2.LINE_AA)
+                                cv2.line(bev_image, (tcx, tcy), center, color, 1, cv2.LINE_AA)
+                                cv2.circle(bev_image, (lcx, lcy), 2, color, -1)
+                                cv2.circle(bev_image, (tcx, tcy), 2, color, -1)
+                        else:
+                            self.get_logger().warn(
+                                f"❌ {class_name} NOT projected: pixel({bev_pixel_x},{bev_pixel_y}) out of BEV bounds"
+                            )
                     else:
-                        # Debug: Log why object was filtered out by distance
-                        self.get_logger().warn(f"❌ {class_name} filtered by distance: {min_depth_m:.2f}m outside range ({self.min_distance}-{self.max_distance}m)")
+                        self.get_logger().warn(
+                            f"❌ {class_name} filtered by distance: {min_depth_m:.2f}m "
+                            f"(allowed {self.min_distance}-{self.max_distance}m)"
+                        )
                 else:
-                    # Debug: Log objects with no valid depth
-                    self.get_logger().warn(f"❌ {class_name} has no valid depth values from mask region")
+                    self.get_logger().warn(f"❌ {class_name} has no valid depth values")
+
+                # Write back only if depth computed
+                if has_depth:
+                    for detection in segmentation_data['detections']:
+                        if detection['id'] == i:
+                            detection['depth'] = {
+                                'min_depth_m': float(min_depth_m),
+                                'min_depth_mm': float(min_depth_mm),
+                                'camera_3d': {'x': float(x_3d), 'y': float(y_3d), 'z': float(z_3d)},
+                                'bev_coords': {'x': float(bev_x), 'y': float(bev_y)},
+                                'bev_pixels': {'x': int(bev_pixel_x), 'y': int(bev_pixel_y)},
+                                'size_info': {
+                                    'width_m': float(obj_width_m),
+                                    'height_m': float(obj_height_m),
+                                    'equivalent_radius_m': float(equivalent_radius_m),
+                                    'equivalent_diameter_m': float(equivalent_radius_m * 2),
+                                    'footprint_diameter_m': float(footprint_diameter_m),
+                                    'visual_radius_m': float(radius_m),
+                                    'bev_radius_px': int(bev_radius_px),
+                                    'mask_area_px': int(mask_area_px),
+                                    'depth_basis': 'avg',
+                                    'size_depth_m': float(depth_for_size_m)
+                                }
+                            }
+                            break
+                else:
+                    # Debug: Log why object was not projected to BEV
+                    self.get_logger().warn(f"❌ {class_name} NOT projected: pixel({bev_pixel_x}, {bev_pixel_y}) outside BEV bounds (0-{self.bev_width-1}, 0-{self.bev_height-1})")
+            else:
+                # Debug: Log why object was filtered out by distance
+                self.get_logger().warn(f"❌ {class_name} filtered by distance: {min_depth_m:.2f}m outside range ({self.min_distance}-{self.max_distance}m)")
+        else:
+            # Debug: Log objects with no valid depth
+            self.get_logger().warn(f"❌ {class_name} has no valid depth values from mask region")
         
         return annotated_image, mask_image, segmentation_data, bev_image
     
     def draw_bev_grid(self, bev_image):
-        """Draw grid lines on BEV image with origin at bottom center"""
+        """Draw grid lines on BEV image with origin at bottom center (updated size reference)"""
         # Grid spacing in meters
         grid_spacing = 0.25  # 25cm
         
@@ -659,23 +789,6 @@ class YOLO11SegmentationNode(Node):
         cv2.circle(bev_image, (center_x, self.bev_height - 5), 8, (0, 255, 0), -1)
         cv2.putText(bev_image, "Origin", (center_x - 25, self.bev_height - 15),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        
-        # Add size reference legend (move to top right)
-        legend_x = self.bev_width - 250
-        legend_y = 30
-        cv2.putText(bev_image, "Size Reference:", (legend_x, legend_y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-        
-        # Draw reference circles for different sizes
-        ref_sizes = [0.1, 0.3, 0.5, 1.0]  # meters
-        for i, size_m in enumerate(ref_sizes):
-            ref_radius_px = max(2, int((size_m / self.bev_x_range) * self.bev_width * 0.5))
-            ref_x = legend_x + 20 + i * 50
-            ref_y = legend_y + 25
-            
-            cv2.circle(bev_image, (ref_x, ref_y), ref_radius_px, (150, 150, 150), 1)
-            cv2.putText(bev_image, f"{size_m}m", (ref_x - 10, ref_y + ref_radius_px + 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1)
     
     def publish_results(self, annotated_image, mask_image, segmentation_data, bev_image):
         """Publish all results"""
@@ -782,43 +895,97 @@ class YOLO11SegmentationNode(Node):
             self.get_logger().error(f"❌ Error publishing results: {e}")
     
     def save_result_images(self, annotated_image, mask_image, bev_image):
-        """Save result images"""
+        """Save result images with a configurable minimum interval."""
         try:
-            timestamp = self.get_clock().now().to_msg()
-            timestamp_sec = timestamp.sec
-            timestamp_nsec = timestamp.nanosec
+            # Respect runtime parameter toggle as well
+            if not getattr(self, 'save_results', True):
+                return
+
+            # Ensure directory exists even if toggled at runtime
+            os.makedirs(self.save_path, exist_ok=True)
+
+            current_time = self.get_clock().now().to_msg()
+            last_t = getattr(self, 'last_save_time', None)
+            if last_t is not None:
+                time_diff = (current_time.sec - last_t.sec) + (current_time.nanosec - last_t.nanosec) / 1e9
+                if time_diff < max(0.0, float(getattr(self, 'save_interval_sec', 1.0))):
+                    return  # Skip saving if interval not reached
+
+            # Update last save time
+            self.last_save_time = current_time
+
+            # Build filename
+            timestamp_sec = current_time.sec
+            timestamp_nsec = current_time.nanosec
             dt = datetime.fromtimestamp(timestamp_sec + timestamp_nsec / 1e9)
-            base_filename = f"yolo11_seg_{dt.strftime('%Y%m%d_%H%M%S')}_{timestamp_nsec//1000000:03d}_{self.image_counter:06d}"
-            
-            # Save annotated image
+            base_filename = f"yolo11_seg_{dt.strftime('%Y%m%d_%H%M%S')}_{timestamp_nsec//1000000:03d}_{getattr(self, 'image_counter', 0):06d}"
+
+            # Write files
             annotated_path = os.path.join(self.save_path, f"{base_filename}_annotated.jpg")
-            cv2.imwrite(annotated_path, annotated_image)
-            
-            # Save mask image
             mask_path = os.path.join(self.save_path, f"{base_filename}_masks.jpg")
-            cv2.imwrite(mask_path, mask_image)
-            
-            # Save BEV image
             bev_path = os.path.join(self.save_path, f"{base_filename}_bev.jpg")
+
+            cv2.imwrite(annotated_path, annotated_image)
+            cv2.imwrite(mask_path, mask_image)
             cv2.imwrite(bev_path, bev_image)
-            
-            self.image_counter += 1
-            
+
+            # Increment counter
+            self.image_counter = getattr(self, 'image_counter', 0) + 1
+            self.get_logger().debug(f"Saved images: {annotated_path}, {mask_path}, {bev_path}")
+
         except Exception as e:
             self.get_logger().error(f"❌ Error saving images: {e}")
-def main(args=None):
-    if not YOLO_AVAILABLE:
-        print("❌ Cannot start YOLO11 segmentation node - ultralytics not available")
-        print("💡 Install with: pip install ultralytics")
-        return
-    
-    rclpy.init(args=args)
+
+    # ---------- Helpers for non-overlapping text boxes on BEV ----------
+    def _intersects(self, a, b):
+        # a,b: [x1,y1,x2,y2]
+        return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+    def _place_box_no_overlap(self, box_w, box_h, candidates, taken_rects, canvas_w, canvas_h):
+        # candidates: list of (x1, y1) top-left candidates
+        pad = 0
+        for (cx, cy) in candidates:
+            # clamp to canvas
+            x1 = max(0, min(cx, canvas_w - box_w))
+            y1 = max(0, min(cy, canvas_h - box_h))
+            rect = [x1, y1, x1 + box_w, y1 + box_h]
+            # try small vertical shifts to clear collisions
+            if any(self._intersects(rect, r) for r in taken_rects):
+                step = 12
+                # downwards
+                for k in range(1, 8):
+                    yk = min(canvas_h - box_h, y1 + k * step)
+                    rect_k = [x1, yk, x1 + box_w, yk + box_h]
+                    if not any(self._intersects(rect_k, r) for r in taken_rects):
+                        return rect_k
+                # upwards
+                for k in range(1, 8):
+                    yk = max(0, y1 - k * step)
+                    rect_k = [x1, yk, x1 + box_w, yk + box_h]
+                    if not any(self._intersects(rect_k, r) for r in taken_rects):
+                        return rect_k
+                # rightwards
+                for k in range(1, 8):
+                    xk = min(canvas_w - box_w, x1 + k * step)
+                    rect_k = [xk, y1, xk + box_w, y1 + box_h]
+                    if not any(self._intersects(rect_k, r) for r in taken_rects):
+                        return rect_k
+                # leftwards
+                for k in range(1, 8):
+                    xk = max(0, x1 - k * step)
+                    rect_k = [xk, y1, xk + box_w, y1 + box_h]
+                    if not any(self._intersects(rect_k, r) for r in taken_rects):
+                        return rect_k
+            else:
+                return rect
+        # fallback: bottom-left corner
+        return [pad, canvas_h - box_h - pad, pad + box_w, canvas_h - pad]
+
+def main():
+    rclpy.init()
     node = YOLO11SegmentationNode()
-    
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info("🛑 YOLO11 Segmentation Node shutting down...")
     finally:
         node.destroy_node()
         rclpy.shutdown()
