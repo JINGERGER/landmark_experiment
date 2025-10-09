@@ -1,0 +1,14 @@
+landmark_graph_builder:
+  ros__parameters:
+    bev_objects_topic: "/yolo11/bev/objects"
+    odom_topic: "/odom"
+    landmark_markers_topic: "/landmark_graph/markers"
+    landmark_data_topic: "/landmark_graph/data"
+    association_distance_threshold: 1.0
+    landmark_confidence_threshold: 0.6
+    min_observations: 2
+    max_landmark_age: 30.0
+    publish_rate: 2.0
+    enable_vlm_association: true
+    vlm_model_name: "qwen3-vl-plus"
+    vlm_confidence_threshold: 0.7

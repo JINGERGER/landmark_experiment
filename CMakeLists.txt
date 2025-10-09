@@ -11,6 +11,8 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 # Generate messages
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -23,6 +25,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 install(PROGRAMS
   src/d435i2bev.py
   src/d435i_seg.py
+  src/landmarker_graph_builder.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
