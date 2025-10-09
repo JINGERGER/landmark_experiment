@@ -58,6 +58,8 @@ case $choice in
         echo "   - /camera/camera/color/image_raw (sensor_msgs/Image)"
         echo "   - /yolo11/segmentation/image (sensor_msgs/Image)"
         echo "   - /yolo11/segmentation/masks (sensor_msgs/Image)"
+        echo "   - /yolo11/objects/poses (geometry_msgs/PoseArray) — 3D positions in camera frame"
+        echo "   👉 Set Fixed Frame to your camera frame (from CameraInfo header, e.g. camera_depth_optical_frame)"
         rviz2
         ;;
     3)
@@ -78,11 +80,12 @@ case $choice in
         echo "   - /yolo11/segmentation/image (annotated image with masks)"
         echo "   - /yolo11/segmentation/masks (segmentation masks only)"
         echo "   - /yolo11/segmentation/data (JSON segmentation data)"
+        echo "   - /yolo11/objects/poses (PoseArray with 3D camera-frame positions)"
         echo ""
         echo "💡 RViz2 Setup Tips:"
         echo "   1. Add Image displays for the topics above"
-        echo "   2. Set Fixed Frame to 'camera_color_optical_frame'"
-        echo "   3. Toggle between different image views"
+        echo "   2. Add a PoseArray display on /yolo11/objects/poses (tune Arrow length/width)"
+        echo "   3. Set Fixed Frame to your camera frame (e.g. camera_depth_optical_frame)"
         echo ""
         echo "Press Ctrl+C to stop all nodes..."
         wait
@@ -94,6 +97,9 @@ case $choice in
         echo "   ros2 run rqt_image_view rqt_image_view /camera/camera/color/image_raw"
         echo "   ros2 run rqt_image_view rqt_image_view /yolo11/segmentation/image"
         echo "   ros2 run rqt_image_view rqt_image_view /yolo11/segmentation/masks"
+        echo ""
+        echo "📍 3D Positions:"
+        echo "   ros2 topic echo /yolo11/objects/poses"
         echo ""
         echo "📊 Segmentation Data:"
         echo "   ros2 topic echo /yolo11/segmentation/data"
@@ -151,4 +157,5 @@ except Exception as e:
         echo "❌ Invalid option"
         exit 1
         ;;
+
 esac

@@ -15,6 +15,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import String, Header
 from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray
+# NEW: RViz marker messages
+from visualization_msgs.msg import Marker, MarkerArray
 from cv_bridge import CvBridge
 from bev.msg import BevObject, BevObjectArray
 import cv2
@@ -37,6 +39,31 @@ class YOLO11SegmentationNode(Node):
     def __init__(self):
         super().__init__('yolo11_segmentation_node')
         
+        # Safeguard defaults to avoid AttributeError before parameters are read
+        self.save_results = True
+        self.save_path = '/tmp/yolo11_seg_results'
+        self.save_interval_sec = 5.0
+        # NEW: visualization defaults
+        self.show_fps = True
+        self.show_masks = True
+        self.mask_alpha = 0.4
+        # NEW: BEV defaults (avoid missing attributes before param read)
+        self.bev_width = 800
+        self.bev_height = 600
+        self.bev_x_range = 4.0
+        self.bev_y_range = 3.0
+        self.min_distance = 0.1
+        self.max_distance = 10.0
+        self.bev_size_scale = 1.0
+        # NEW: BEV overlay + label defaults to avoid AttributeError
+        self.bev_draw_connectors = True
+        self.bev_number_labels = True
+        self.bev_label_border_object_color = True
+        self.bev_label_font_scale = 0.9
+        self.bev_info_font_scale = 0.8
+        self.bev_label_thickness = 2
+        self.bev_info_thickness = 2
+
         if not YOLO_AVAILABLE:
             self.get_logger().error("YOLO is not available. Please install ultralytics package.")
             return
@@ -47,14 +74,19 @@ class YOLO11SegmentationNode(Node):
         self.declare_parameter('iou_threshold', 0.5)
         self.declare_parameter('depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
-        self.declare_parameter('camera_info_topic', '/camera/camera/depth/camera_info')
+        self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('output_image_topic', '/yolo11/segmentation/image')
         self.declare_parameter('output_masks_topic', '/yolo11/segmentation/masks')
         self.declare_parameter('output_data_topic', '/yolo11/segmentation/data')
         self.declare_parameter('output_bev_topic', '/yolo11/bev/detections')
         self.declare_parameter('output_bev_data_topic', '/yolo11/bev/objects')  # New topic for structured BEV data
-        self.declare_parameter('save_results', True)
-        self.declare_parameter('save_path', '/tmp/yolo11_seg_results')
+        # NEW: PoseArray topic for 3D positions in camera frame
+        self.declare_parameter('output_posearray_topic', '/yolo11/objects/poses')
+        # NEW: MarkerArray topic and style for RViz visualization of BEV data
+        self.declare_parameter('output_bev_markers_topic', '/yolo11/bev/markers')
+        self.declare_parameter('bev_marker_text_scale', 0.15)   # meters (height of text)
+        self.declare_parameter('bev_marker_thickness', 0.02)    # meters (z thickness of footprint)
+        # NEW: Visualization parameters
         self.declare_parameter('show_fps', True)
         self.declare_parameter('show_masks', True)
         self.declare_parameter('mask_alpha', 0.4)  # Transparency for mask overlay
@@ -78,7 +110,7 @@ class YOLO11SegmentationNode(Node):
         self.declare_parameter('bev_info_font_scale', 0.8)
         self.declare_parameter('bev_label_thickness', 2)
         self.declare_parameter('bev_info_thickness', 2)
-        # ... existing code ...
+        # ...existing code...
 
         # Get parameters
         self.model_name = self.get_parameter('model_name').get_parameter_value().string_value
@@ -92,37 +124,39 @@ class YOLO11SegmentationNode(Node):
         self.output_data_topic = self.get_parameter('output_data_topic').get_parameter_value().string_value
         self.output_bev_topic = self.get_parameter('output_bev_topic').get_parameter_value().string_value
         self.output_bev_data_topic = self.get_parameter('output_bev_data_topic').get_parameter_value().string_value
-        self.save_results = self.get_parameter('save_results').get_parameter_value().bool_value
-        self.save_path = self.get_parameter('save_path').get_parameter_value().string_value
-        self.show_fps = self.get_parameter('show_fps').get_parameter_value().bool_value
-        self.show_masks = self.get_parameter('show_masks').get_parameter_value().bool_value
-        self.mask_alpha = self.get_parameter('mask_alpha').get_parameter_value().double_value
-        # Get configurable save interval
-        self.save_interval_sec = self.get_parameter('save_interval_sec').get_parameter_value().double_value
-        
-        # BEV parameters
-        self.bev_width = self.get_parameter('bev_width').get_parameter_value().integer_value
-        self.bev_height = self.get_parameter('bev_height').get_parameter_value().integer_value
-        self.bev_x_range = self.get_parameter('bev_x_range').get_parameter_value().double_value
-        self.bev_y_range = self.get_parameter('bev_y_range').get_parameter_value().double_value
-        self.min_distance = self.get_parameter('min_distance').get_parameter_value().double_value
-        self.max_distance = self.get_parameter('max_distance').get_parameter_value().double_value
-        self.bev_size_scale = self.get_parameter('bev_size_scale').get_parameter_value().double_value
-        ref_str = self.get_parameter('bev_size_reference_values').get_parameter_value().string_value
+        # NEW: Read PoseArray and Marker topics
+        self.output_posearray_topic = self.get_parameter('output_posearray_topic').get_parameter_value().string_value
+        self.output_bev_markers_topic = self.get_parameter('output_bev_markers_topic').get_parameter_value().string_value
+        self.bev_marker_text_scale = self.get_parameter('bev_marker_text_scale').get_parameter_value().double_value
+        self.bev_marker_thickness = self.get_parameter('bev_marker_thickness').get_parameter_value().double_value
+        # NEW: Read BEV parameters into attributes
         try:
-            self.bev_size_ref_values = [float(v.strip()) for v in ref_str.split(',') if v.strip()]
-        except Exception:
-            self.bev_size_ref_values = [0.1, 0.3, 0.5, 1.0]
-        # Read BEV label/layout options
-        self.bev_draw_connectors = self.get_parameter('bev_draw_connectors').get_parameter_value().bool_value
-        self.bev_number_labels = self.get_parameter('bev_number_labels').get_parameter_value().bool_value
-        self.bev_label_border_object_color = self.get_parameter('bev_label_border_object_color').get_parameter_value().bool_value
-        # NEW: Read BEV font configuration
-        self.bev_label_font_scale = self.get_parameter('bev_label_font_scale').get_parameter_value().double_value
-        self.bev_info_font_scale = self.get_parameter('bev_info_font_scale').get_parameter_value().double_value
-        self.bev_label_thickness = self.get_parameter('bev_label_thickness').get_parameter_value().integer_value
-        self.bev_info_thickness = self.get_parameter('bev_info_thickness').get_parameter_value().integer_value
-        
+            self.bev_width = self.get_parameter('bev_width').get_parameter_value().integer_value
+            self.bev_height = self.get_parameter('bev_height').get_parameter_value().integer_value
+            self.bev_x_range = self.get_parameter('bev_x_range').get_parameter_value().double_value
+            self.bev_y_range = self.get_parameter('bev_y_range').get_parameter_value().double_value
+            self.min_distance = self.get_parameter('min_distance').get_parameter_value().double_value
+            self.max_distance = self.get_parameter('max_distance').get_parameter_value().double_value
+            self.bev_size_scale = self.get_parameter('bev_size_scale').get_parameter_value().double_value
+            ref_str = self.get_parameter('bev_size_reference_values').get_parameter_value().string_value
+            try:
+                self.bev_size_ref_values = [float(v.strip()) for v in ref_str.split(',') if v.strip()]
+            except Exception:
+                self.bev_size_ref_values = [0.1, 0.3, 0.5, 1.0]
+        except Exception as e:
+            self.get_logger().warn(f"Using BEV default params due to read error: {e}")
+        # NEW: Read BEV overlay/label params
+        try:
+            self.bev_draw_connectors = self.get_parameter('bev_draw_connectors').get_parameter_value().bool_value
+            self.bev_number_labels = self.get_parameter('bev_number_labels').get_parameter_value().bool_value
+            self.bev_label_border_object_color = self.get_parameter('bev_label_border_object_color').get_parameter_value().bool_value
+            self.bev_label_font_scale = self.get_parameter('bev_label_font_scale').get_parameter_value().double_value
+            self.bev_info_font_scale = self.get_parameter('bev_info_font_scale').get_parameter_value().double_value
+            self.bev_label_thickness = int(self.get_parameter('bev_label_thickness').get_parameter_value().integer_value)
+            self.bev_info_thickness = int(self.get_parameter('bev_info_thickness').get_parameter_value().integer_value)
+        except Exception as e:
+            self.get_logger().warn(f"Using BEV label defaults due to read error: {e}")
+
         # Initialize YOLO11 segmentation model
         self.get_logger().info(f"Loading YOLO11 segmentation model: {self.model_name}")
         try:
@@ -146,6 +180,8 @@ class YOLO11SegmentationNode(Node):
         self.fy = None
         self.cx = None
         self.cy = None
+        # NEW: camera frame id for RViz
+        self.camera_frame_id = None
         
         # Synchronization
         self.depth_image = None
@@ -214,8 +250,20 @@ class YOLO11SegmentationNode(Node):
         )
         
         self.bev_data_pub = self.create_publisher(
-            BevObjectArray,  # 使用自定义消息类型代替String
+            BevObjectArray,
             self.output_bev_data_topic,
+            10
+        )
+        # NEW: PoseArray publisher for 3D obstacle positions
+        self.objects_pose_pub = self.create_publisher(
+            PoseArray,
+            self.output_posearray_topic,
+            10
+        )
+        # NEW: MarkerArray publisher for BEV visualization in RViz
+        self.bev_markers_pub = self.create_publisher(
+            MarkerArray,
+            self.output_bev_markers_topic,
             10
         )
         
@@ -228,6 +276,9 @@ class YOLO11SegmentationNode(Node):
         self.get_logger().info(f"📤 Publishing segmentation data to: {self.output_data_topic}")
         self.get_logger().info(f"📤 Publishing BEV detections to: {self.output_bev_topic}")
         self.get_logger().info(f"📤 Publishing BEV object data to: {self.output_bev_data_topic}")
+        # NEW: Log RViz topics
+        self.get_logger().info(f"📤 Publishing 3D poses to: {self.output_posearray_topic}")
+        self.get_logger().info(f"📤 Publishing BEV markers to: {self.output_bev_markers_topic}")
 
     def camera_info_callback(self, msg):
         """Store camera intrinsics for depth-to-3D conversion"""
@@ -237,6 +288,8 @@ class YOLO11SegmentationNode(Node):
             self.fy = msg.k[4]  # Focal length Y
             self.cx = msg.k[2]  # Principal point X
             self.cy = msg.k[5]  # Principal point Y
+            # NEW: remember camera frame for RViz PoseArray
+            self.camera_frame_id = msg.header.frame_id if msg.header and msg.header.frame_id else 'camera'
             self.get_logger().info(f"📷 Camera intrinsics received: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
 
     def depth_callback(self, msg):
@@ -540,6 +593,15 @@ class YOLO11SegmentationNode(Node):
                     depth_for_size_m = avg_depth_m
                     has_depth = True
 
+                    # Use robust intrinsics (fallback to image center if cx,cy invalid)
+                    img_h, img_w = color_image.shape[:2]
+                    fx_use = float(self.fx) if (self.fx is not None and self.fx > 1e-6) else float(img_w)
+                    fy_use = float(self.fy) if (self.fy is not None and self.fy > 1e-6) else float(img_h)
+                    cx_use = float(self.cx) if (self.cx is not None and 0.0 < self.cx < img_w) else float(img_w) / 2.0
+                    cy_use = float(self.cy) if (self.cy is not None and 0.0 < self.cy < img_h) else float(img_h) / 2.0
+                    if (cx_use == img_w / 2.0) or (cy_use == img_h / 2.0):
+                        self.get_logger().warn("Camera intrinsics cx/cy out of range; using image center fallback for projection")
+                    
                     self.get_logger().info(
                         f"🔍 {class_name} depth: {min_depth_m:.2f}m (range: {self.min_distance}-{self.max_distance}m), valid_depths: {len(valid_depths)}"
                     )
@@ -551,8 +613,8 @@ class YOLO11SegmentationNode(Node):
                         center_y = (y1 + y2) // 2
                         
                         # Camera 3D (use min depth for position)
-                        x_3d = (center_x - self.cx) * min_depth_m / self.fx if self.fx else 0.0
-                        y_3d = (center_y - self.cy) * min_depth_m / self.fy if self.fy else 0.0
+                        x_3d = (center_x - cx_use) * min_depth_m / fx_use
+                        y_3d = (center_y - cy_use) * min_depth_m / fy_use
                         z_3d = min_depth_m
                         
                         # BEV meters
@@ -570,15 +632,15 @@ class YOLO11SegmentationNode(Node):
                         # Compute metric size using avg depth (more stable)
                         obj_width_px = max(1, x2 - x1)
                         obj_height_px = max(1, y2 - y1)
-                        if depth_for_size_m > 0 and self.fx and self.fy:
-                            obj_width_m = (obj_width_px * depth_for_size_m) / self.fx
-                            obj_height_m = (obj_height_px * depth_for_size_m) / self.fy
+                        if depth_for_size_m > 0:
+                            obj_width_m = (obj_width_px * depth_for_size_m) / fx_use
+                            obj_height_m = (obj_height_px * depth_for_size_m) / fy_use
 
                         # Mask → equivalent radius in meters
                         mask_area_px = int(np.sum(mask_binary))
                         if mask_area_px > 0 and depth_for_size_m > 0:
                             equivalent_radius_px = np.sqrt(mask_area_px / np.pi)
-                            f_mean = (self.fx + self.fy) / 2.0 if (self.fx and self.fy) else (self.fx or 1.0)
+                            f_mean = (fx_use + fy_use) / 2.0
                             equivalent_radius_m = (equivalent_radius_px * depth_for_size_m) / f_mean
                         else:
                             equivalent_radius_m = 0.0
@@ -813,6 +875,17 @@ class YOLO11SegmentationNode(Node):
             # Publish structured BEV data using custom message format
             if len(segmentation_data['detections']) > 0:
                 bev_objects_with_depth = []
+                # NEW: PoseArray for RViz 3D visualization
+                pose_array = PoseArray()
+                pose_array.header.stamp = header
+                pose_array.header.frame_id = self.camera_frame_id or 'camera'
+                # NEW: MarkerArray for BEV visualization
+                markers = MarkerArray()
+                # Clear previous markers
+                mclear = Marker()
+                mclear.action = Marker.DELETEALL
+                markers.markers.append(mclear)
+                marker_id = 0
                 
                 for detection in segmentation_data['detections']:
                     # Only include objects that have depth and BEV coordinates
@@ -850,6 +923,93 @@ class YOLO11SegmentationNode(Node):
                         bev_obj.area_pixels = int(detection['segmentation']['area'])
                         
                         bev_objects_with_depth.append(bev_obj)
+                        # NEW: append pose for RViz
+                        try:
+                            p = Pose()
+                            p.position.x = float(camera_3d['x'])
+                            p.position.y = float(camera_3d['y'])
+                            p.position.z = float(camera_3d['z'])
+                            p.orientation.x = 0.0
+                            p.orientation.y = 0.0
+                            p.orientation.z = 0.0
+                            p.orientation.w = 1.0
+                            pose_array.poses.append(p)
+                        except Exception:
+                            pass
+                        
+                        # Build BEV footprint and label markers in camera frame
+                        try:
+                            # Map BEV (forward x, left y) -> camera optical frame (x right, y down, z forward)
+                            bev_x = float(bev_coords['x'])
+                            bev_y = float(bev_coords['y'])
+                            px = -bev_y
+                            py = 0.0
+                            pz = bev_x
+                            # Sizes
+                            width_m = float(size_info.get('width_m', 0.0))
+                            height_m = float(size_info.get('height_m', 0.0))
+                            eq_d = float(size_info.get('equivalent_diameter_m', 0.2))
+                            if width_m <= 0.0:
+                                width_m = eq_d
+                            if height_m <= 0.0:
+                                height_m = eq_d
+                            # Color
+                            cls_name = detection['class']
+                            # Map class name back to id to reuse palette if possible
+                            # Fallback: hash name
+                            try:
+                                # Find the class id by name if available
+                                class_id = next((cid for cid, name in self.yolo_model.names.items() if name == cls_name), 0)
+                            except Exception:
+                                class_id = 0
+                            bgr = self.get_class_color(class_id)
+                            r, g, b = bgr[2]/255.0, bgr[1]/255.0, bgr[0]/255.0
+                            # Footprint marker (ellipsoid disc)
+                            mf = Marker()
+                            mf.header.stamp = header
+                            mf.header.frame_id = self.camera_frame_id or 'camera'
+                            mf.ns = 'bev_footprint'
+                            mf.id = marker_id; marker_id += 1
+                            mf.type = Marker.CUBE
+                            mf.action = Marker.ADD
+                            mf.pose.position.x = px
+                            mf.pose.position.y = py
+                            mf.pose.position.z = pz
+                            mf.pose.orientation.x = 0.0
+                            mf.pose.orientation.y = 0.0
+                            mf.pose.orientation.z = 0.0
+                            mf.pose.orientation.w = 1.0
+                            mf.scale.x = max(0.05, width_m)
+                            mf.scale.y = max(0.05, height_m)
+                            mf.scale.z = max(0.005, float(self.bev_marker_thickness))
+                            mf.color.r = r
+                            mf.color.g = g
+                            mf.color.b = b
+                            mf.color.a = 0.6
+                            markers.markers.append(mf)
+                            # Text marker
+                            mt = Marker()
+                            mt.header.stamp = header
+                            mt.header.frame_id = self.camera_frame_id or 'camera'
+                            mt.ns = 'bev_label'
+                            mt.id = marker_id; marker_id += 1
+                            mt.type = Marker.TEXT_VIEW_FACING
+                            mt.action = Marker.ADD
+                            mt.pose.position.x = px
+                            mt.pose.position.y = py
+                            mt.pose.position.z = pz + max(0.05, mf.scale.z * 2.0)
+                            mt.scale.z = max(0.05, float(self.bev_marker_text_scale))
+                            mt.color.r = 1.0
+                            mt.color.g = 1.0
+                            mt.color.b = 0.0
+                            mt.color.a = 1.0
+                            dist_m = float(detection['depth']['min_depth_m']) if 'depth' in detection else 0.0
+                            size_text = width_m if width_m >= height_m else height_m
+                            mt.text = f"{cls_name} {dist_m:.3f}m {size_text:.3f}m"
+                            markers.markers.append(mt)
+                        except Exception as e:
+                            # Skip marker on failure but continue others
+                            self.get_logger().warn(f"Marker build failed: {e}")
                 
                 if len(bev_objects_with_depth) > 0:
                     # Create BevObjectArray message
@@ -869,7 +1029,12 @@ class YOLO11SegmentationNode(Node):
                     self.bev_data_pub.publish(bev_array)
                     
                     self.get_logger().info(f"📍 Published BEV structured data for {len(bev_objects_with_depth)} objects using custom message format")
-            
+                # NEW: Publish PoseArray for RViz
+                if len(pose_array.poses) > 0:
+                    self.objects_pose_pub.publish(pose_array)
+                # NEW: Publish MarkerArray for RViz
+                if len(markers.markers) > 0:
+                    self.bev_markers_pub.publish(markers)
             # Publish BEV image (existing code)
             bev_msg = self.bridge.cv2_to_imgmsg(bev_image, encoding='bgr8')
             bev_msg.header.stamp = header
