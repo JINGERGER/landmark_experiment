@@ -798,12 +798,11 @@ class YOLO11SegmentationNode(Node):
                 else:
                     # Debug: Log why object was not projected to BEV
                     self.get_logger().warn(f"❌ {class_name} NOT projected: pixel({bev_pixel_x}, {bev_pixel_y}) outside BEV bounds (0-{self.bev_width-1}, 0-{self.bev_height-1})")
-            else:
-                # Debug: Log why object was filtered out by distance
-                self.get_logger().warn(f"❌ {class_name} filtered by distance: {min_depth_m:.2f}m outside range ({self.min_distance}-{self.max_distance}m)")
+            # No boxes/masks available in YOLO result
+            self.get_logger().warn("YOLO result has no boxes/masks; skipping BEV projection")
         else:
-            # Debug: Log objects with no valid depth
-            self.get_logger().warn(f"❌ {class_name} has no valid depth values from mask region")
+            # No boxes/masks available in YOLO result
+            self.get_logger().warn("YOLO result has no boxes/masks; skipping BEV projection")
         
         return annotated_image, mask_image, segmentation_data, bev_image
     
