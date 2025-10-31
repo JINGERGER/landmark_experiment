@@ -619,7 +619,7 @@ class YOLO11SegmentationNode(Node):
                         
                         # BEV meters
                         bev_x = z_3d
-                        bev_y = -x_3d
+                        bev_y = x_3d
                         
                         # BEV pixels (origin: bottom-center)
                         bev_pixel_x = int(self.bev_width/2 + (bev_y / self.bev_y_range) * self.bev_width)
@@ -941,7 +941,7 @@ class YOLO11SegmentationNode(Node):
                             # Map BEV (forward x, left y) -> camera optical frame (x right, y down, z forward)
                             bev_x = float(bev_coords['x'])
                             bev_y = float(bev_coords['y'])
-                            px = -bev_y
+                            px = bev_y
                             py = 0.0
                             pz = bev_x
                             # Sizes
